@@ -1,0 +1,27 @@
+# Virtual env
+brain_env/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Models
+*.pth
+*.pt
+*.h5
+
+# Data
+dataset/
+*.jpg
+*.png
+
+# System
+.DS_Store
+.env
+
+# Ignore the big data and the logs
+*.zip
+results/
+__pycache__/
+*.pth
