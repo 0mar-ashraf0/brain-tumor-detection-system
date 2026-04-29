@@ -15,7 +15,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Custom Styling ---
 st.markdown("""
 <style>
     [data-testid="stAppViewContainer"] {
@@ -73,7 +72,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Load Model & Transforms ---
 @st.cache_resource
 def load_trained_model():
     return load_model(MODEL_PATH)
@@ -84,7 +82,6 @@ test_transform = A.Compose([
     ToTensorV2()
 ])
 
-# Updated: Enhancement is now controlled by the user
 def preprocess_mri(image, apply_enhance):
     img_array = np.array(image)
     avg_brightness = img_array.mean()
@@ -92,18 +89,18 @@ def preprocess_mri(image, apply_enhance):
         image = ImageOps.autocontrast(image, cutoff=2)
     return image, avg_brightness
 
-# Updated: Removed vertical flips to prevent confusing the model
 def predict_tta(model, input_tensor):
     flips = [
         input_tensor,
-        torch.flip(input_tensor, dims=[3]), # Horizontal flip only
+        torch.flip(input_tensor, dims=[3]),
     ]
     all_probs = []
     model.eval()
     with torch.no_grad():
         for x in flips:
             out = model(x)
-            prob = torch.softmax(out, dim=1)[0].cpu().numpy()
+            # Added .detach() to prevent memory leaks
+            prob = torch.softmax(out, dim=1)[0].detach().cpu().numpy()
             all_probs.append(prob)
     return np.mean(all_probs, axis=0)
 
@@ -113,7 +110,65 @@ def get_probs_from_image(model, image):
     input_tensor = augmented['image'].float().unsqueeze(0).to(DEVICE)
     return predict_tta(model, input_tensor)
 
-# --- Header ---
+def fuse_views(probs_list):
+    """
+    Smart fusion for 1, 2, or 3 views.
+    - All agree → average
+    - Majority detects tumor → weight tumor views by confidence
+    - Only 1 detects tumor → trust it (clinical safety)
+    - All say no tumor → average
+    """
+    n = len(probs_list)
+
+    if n == 1:
+        return probs_list[0], None, False
+
+    preds = [CLASSES[np.argmax(p)] for p in probs_list]
+    tumor_indices  = [i for i, p in enumerate(preds) if p != 'notumor']
+    notumor_indices = [i for i, p in enumerate(preds) if p == 'notumor']
+
+    # All agree on same class
+    if len(set(preds)) == 1:
+        final_probs = np.mean(probs_list, axis=0)
+        reason = f"All {n} views agree — averaged"
+        views_disagree = False
+
+    # All detect tumor but disagree on type
+    elif len(tumor_indices) == n:
+        confs   = [np.max(probs_list[i]) for i in tumor_indices]
+        total   = sum(confs)
+        weights = [c / total for c in confs]
+        final_probs = sum(w * probs_list[i] for w, i in zip(weights, tumor_indices))
+        dominant = tumor_indices[int(np.argmax(confs))] + 1
+        reason = f"All detect tumor but disagree on type — confidence weighted (View {dominant} dominant: {max(confs)/total:.0%})"
+        views_disagree = True
+
+    # Majority detects tumor
+    elif len(tumor_indices) >= len(notumor_indices):
+        confs   = [np.max(probs_list[i]) for i in tumor_indices]
+        total   = sum(confs)
+        weights = [c / total for c in confs]
+        final_probs = sum(w * probs_list[i] for w, i in zip(weights, tumor_indices))
+        dominant = tumor_indices[int(np.argmax(confs))] + 1
+        reason = f"{len(tumor_indices)}/{n} views detect tumor — tumor views weighted (View {dominant} dominant)"
+        views_disagree = True
+
+    # Only 1 detects tumor — trust it clinically
+    elif len(tumor_indices) == 1:
+        idx = tumor_indices[0]
+        final_probs = probs_list[idx]
+        reason = f"Only View {idx+1} detects tumor — prioritized for clinical safety"
+        views_disagree = True
+
+    # All say no tumor
+    else:
+        final_probs = np.mean(probs_list, axis=0)
+        reason = "All views agree — no tumor detected"
+        views_disagree = False
+
+    return final_probs, reason, views_disagree
+
+# Header
 st.markdown("""
 <div style='text-align:center; padding: 1rem 0 2rem 0;'>
     <h1>🧠 Brain Tumor Detection System</h1>
@@ -125,113 +180,145 @@ st.markdown("---")
 
 model = load_trained_model()
 
-# --- Main UI ---
 st.subheader("🩻 Upload MRI Scans")
-st.caption("Upload 1 or 2 views (e.g. coronal + sagittal) for more accurate diagnosis")
+st.caption("Upload any combination of views (axial, coronal, sagittal). Uploading all 3 yields maximum accuracy.")
 
-# NEW: The Doctor's Control Toggle
-apply_enhance = st.checkbox("⚡ Apply Auto-Contrast (Check this only if the uploaded scan is extremely dark)", value=False)
+apply_enhance = st.checkbox("⚡ Apply Auto-Contrast (check only if the uploaded scan is extremely dark)", value=False)
 
-upload_col1, upload_col2 = st.columns(2)
+# 3 upload slots - Removed "required" bias
+upload_col1, upload_col2, upload_col3 = st.columns(3)
 with upload_col1:
-    st.markdown("**View 1** (required)")
-    file1 = st.file_uploader("Upload first MRI view", type=['jpg', 'jpeg', 'png'], key="file1")
+    st.markdown("**Coronal View**")
+    file1 = st.file_uploader("Upload coronal view", type=['jpg', 'jpeg', 'png'], key="file1")
 with upload_col2:
-    st.markdown("**View 2** (optional)")
-    file2 = st.file_uploader("Upload second MRI view", type=['jpg', 'jpeg', 'png'], key="file2")
+    st.markdown("**Sagittal View**")
+    file2 = st.file_uploader("Upload sagittal view", type=['jpg', 'jpeg', 'png'], key="file2")
+with upload_col3:
+    st.markdown("**Axial View**")
+    file3 = st.file_uploader("Upload axial view", type=['jpg', 'jpeg', 'png'], key="file3")
 
-if file1 is not None:
-    # Process view 1
-    image1 = Image.open(file1).convert('RGB')
-    image1, brightness1 = preprocess_mri(image1, apply_enhance)
-    probs1 = get_probs_from_image(model, image1)
+# Trigger inference if ANY file is uploaded
+if any(f is not None for f in [file1, file2, file3]):
+    uploaded = []
+    
+    # Process all uploaded views safely
+    for f, label in [(file1, "Coronal"), (file2, "Sagittal"), (file3, "Axial")]:
+        if f is not None:
+            try:
+                img, brightness = preprocess_mri(Image.open(f).convert('RGB'), apply_enhance)
+                probs = get_probs_from_image(model, img)
+                uploaded.append({
+                    'image':      img,
+                    'brightness': brightness,
+                    'probs':      probs,
+                    'label':      label,
+                    'pred_class': CLASSES[np.argmax(probs)],
+                    'pred_conf':  np.max(probs)
+                })
+            except Exception as e:
+                st.error(f"⚠️ Error processing the {label} view. Please ensure it is a valid image file. Details: {e}")
 
-    # Process view 2 if uploaded
-    if file2 is not None:
-        image2 = Image.open(file2).convert('RGB')
-        image2, brightness2 = preprocess_mri(image2, apply_enhance)
-        probs2 = get_probs_from_image(model, image2)
-        final_probs = np.mean([probs1, probs2], axis=0)
-        num_views = 2
-    else:
-        final_probs = probs1
-        num_views = 1
+    # Only proceed if we successfully processed at least one image
+    if len(uploaded) > 0:
+        num_views   = len(uploaded)
+        probs_list  = [v['probs'] for v in uploaded]
+        final_probs, reason, views_disagree = fuse_views(probs_list)
 
-    pred_idx   = np.argmax(final_probs)
-    pred_class = CLASSES[pred_idx]
-    pred_conf  = final_probs[pred_idx]
-    display_name = pred_class.title().replace('Notumor', 'No Tumor')
+        pred_idx     = np.argmax(final_probs)
+        pred_class   = CLASSES[pred_idx]
+        pred_conf    = final_probs[pred_idx]
+        display_name = pred_class.title().replace('Notumor', 'No Tumor')
 
-    st.markdown("---")
-
-    # Show uploaded scans (Updated to use_container_width)
-    st.markdown(f"#### 📋 Uploaded Scans ({num_views} view{'s' if num_views > 1 else ''})")
-    preview_col1, preview_col2 = st.columns(2)
-    with preview_col1:
-        st.image(image1, caption=f"View 1 {'⚡ Enhanced' if apply_enhance else '✅ Normal'}", use_column_width=True)
-        st.caption(f"Avg brightness: {brightness1:.1f}")
-    with preview_col2:
-        if file2 is not None:
-            st.image(image2, caption=f"View 2 {'⚡ Enhanced' if apply_enhance else '✅ Normal'}", use_column_width=True)
-            st.caption(f"Avg brightness: {brightness2:.1f}")
-        else:
-            st.info("No second view uploaded — using single view prediction")
-
-    st.markdown("---")
-
-    # Results
-    result_col1, result_col2 = st.columns([1, 1], gap="large")
-
-    with result_col1:
-        st.markdown(f"#### 🔬 AI Diagnosis — {num_views} View{'s' if num_views > 1 else ''}")
-
-        m1, m2 = st.columns(2)
-        with m1:
-            st.metric("Predicted Class", display_name)
-        with m2:
-            st.metric("Confidence Score", f"{pred_conf:.1%}")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        if pred_conf < 0.80:
-            st.warning("⚠️ Low confidence — try adding a second view for better accuracy")
-
-        if pred_class == 'notumor':
-            st.success(f"✅ No Tumor Detected — Confidence: {pred_conf:.1%}")
-        elif pred_conf > 0.85:
-            st.error(f"🔴 {display_name} Tumor Detected — Confidence: {pred_conf:.1%}")
-        else:
-            st.warning(f"🟡 {display_name} Tumor Suspected — Confidence: {pred_conf:.1%}")
-
-    with result_col2:
-        st.markdown("#### 📊 Class Probability Breakdown")
         display_names = {
             'glioma':     'Glioma',
             'meningioma': 'Meningioma',
             'notumor':    'No Tumor',
             'pituitary':  'Pituitary'
         }
-        prob_df = pd.DataFrame({
-            'Class': [display_names[c] for c in CLASSES],
-            'Probability (%)': final_probs * 100
-        }).sort_values('Probability (%)', ascending=True)
-        st.bar_chart(prob_df.set_index('Class'), height=250)
 
-        if num_views == 2:
-            st.markdown("#### 📐 Per-View Breakdown")
-            view_col1, view_col2 = st.columns(2)
-            with view_col1:
-                st.caption("View 1")
-                for i, c in enumerate(CLASSES):
-                    st.progress(float(probs1[i]), text=f"{display_names[c]}: {probs1[i]:.1%}")
-            with view_col2:
-                st.caption("View 2")
-                for i, c in enumerate(CLASSES):
-                    st.progress(float(probs2[i]), text=f"{display_names[c]}: {probs2[i]:.1%}")
+        st.markdown("---")
+
+        # Show uploaded scans
+        st.markdown(f"#### 📋 Uploaded Scans ({num_views} view{'s' if num_views > 1 else ''})")
+        preview_cols = st.columns(3)
+        for i, col in enumerate(preview_cols):
+            with col:
+                if i < len(uploaded):
+                    v = uploaded[i]
+                    st.image(v['image'], 
+                        caption=f"{v['label']} {'⚡ Enhanced' if apply_enhance else '✅ Normal'}", 
+                        use_column_width=True) # Updated to use_container_width (Streamlit 1.27+)
+                    pred_display = v['pred_class'].title().replace('Notumor', 'No Tumor')
+                    st.caption(f"Brightness: {v['brightness']:.1f} | {pred_display} ({v['pred_conf']:.1%})")
+                else:
+                    st.markdown(
+                        "<div style='border:2px dashed #1e3a5f; border-radius:10px; "
+                        "height:150px; display:flex; align-items:center; justify-content:center; "
+                        "color:#546e7a;'>No view uploaded</div>",
+                        unsafe_allow_html=True
+                    )
+
+        st.markdown("---")
+
+        # Results
+        result_col1, result_col2 = st.columns([1, 1], gap="large")
+
+        with result_col1:
+            st.markdown(f"#### 🔬 AI Diagnosis — {num_views} View{'s' if num_views > 1 else ''}")
+            
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric("Predicted Class", display_name)
+            with m2:
+                st.metric("Confidence Score", f"{pred_conf:.1%}")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Decision logic
+            if reason:
+                st.caption(f"🧠 Decision logic: {reason}")
+
+            # Disagreement warning
+            if views_disagree:
+                st.warning("⚠️ Views disagree — please consult a radiologist for further evaluation.")
+            
+            # Low confidence warning
+            if pred_conf < 0.80:
+                st.warning("⚠️ Low confidence — try uploading additional views for better accuracy.")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Diagnosis badge
+            if pred_class == 'notumor':
+                st.success(f"✅ No Tumor Detected — Confidence: {pred_conf:.1%}")
+            elif pred_conf > 0.85:
+                st.error(f"🔴 {display_name} Tumor Detected — Confidence: {pred_conf:.1%}")
+            else:
+                st.warning(f"🟡 {display_name} Tumor Suspected — Confidence: {pred_conf:.1%}")
+
+        with result_col2:
+            st.markdown("#### 📊 Final Probability Breakdown")
+            prob_df = pd.DataFrame({
+                'Class': [display_names[c] for c in CLASSES],
+                'Probability (%)': final_probs * 100
+            }).sort_values('Probability (%)', ascending=True)
+            st.bar_chart(prob_df.set_index('Class'), height=250)
+
+            # Per-view breakdown
+            if num_views > 1:
+                st.markdown("#### 📐 Per-View Breakdown")
+                view_cols = st.columns(num_views)
+                for i, col in enumerate(view_cols):
+                    with col:
+                        v = uploaded[i]
+                        pred_display = v['pred_class'].title().replace('Notumor', 'No Tumor')
+                        st.caption(f"{v['label']} — {pred_display} ({v['pred_conf']:.1%})")
+                        for j, c in enumerate(CLASSES):
+                            st.progress(float(v['probs'][j]), 
+                                text=f"{display_names[c]}: {v['probs'][j]:.1%}")
 
 st.markdown("---")
 
-# --- Sidebar Info ---
 st.sidebar.markdown("## 🧠 System Info")
 st.sidebar.markdown("""
 **Model Architecture:**
@@ -244,9 +331,12 @@ st.sidebar.markdown("""
 - Glioma · Meningioma · No Tumor · Pituitary
 - ImageNet Pretrained Backbones
 
-**Tip:**
-Upload coronal + sagittal views
-together for best accuracy.
+**Best Practice:**
+Upload all 3 views for maximum
+diagnostic accuracy:
+- Coronal
+- Sagittal 
+- Axial 
 
 **Disclaimer:**
 Research prototype only.
