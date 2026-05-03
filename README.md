@@ -52,12 +52,6 @@ The system processes **224×224 MRI images** through a parallel pipeline:
 
 ---
 
-## 🖥️ Demo
-
-> *(Add screenshots or demo link here)*
-
----
-
 ## ⚙️ Installation
 
 ```bash
@@ -71,3 +65,17 @@ pip install -r requirements.txt
 Dataset used: Brain Tumor MRI Dataset  
 (Not included due to size)
 
+---
+
+## start server
+```bash
+cd brain_tumor_detector
+streamlit run app_medical.py
+```
+
+---
+
+## activate env
+```bash
+brain_env\Scripts\activate
+```
